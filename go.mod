@@ -1,4 +1,4 @@
-module forgejo.senseivision.ai/senseivision/go-viper-config
+module forgejo.senseivision.ai/public/go-viper-config
 
 go 1.23.0
 
