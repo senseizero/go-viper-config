@@ -75,7 +75,7 @@ func defaultOptions() LoadOptions {
 //
 // Example:
 //
-/cfg := viperconfig.MustLoad(&MyConfig{})/
+// cfg := viperconfig.MustLoad(&MyConfig{})/MyConfig{})
 func MustLoad[T any](cfg *T, opts ...Option) *T {
 	result, err := Load(cfg, opts...)
 	if err != nil {
@@ -89,10 +89,10 @@ func MustLoad[T any](cfg *T, opts ...Option) *T {
 //
 // Example:
 //
-/cfg, err := viperconfig.Load(&MyConfig{},/
-/    viperconfig.WithEnvPrefix("MYAPP"),/
-/    viperconfig.WithConfigName("myconfig"),/
-/)/
+// cfg, err := viperconfig.Load(&MyConfig{},/
+//     viperconfig.WithEnvPrefix("MYAPP"),
+//     viperconfig.WithConfigName("myconfig"),
+// )
 func Load[T any](cfg *T, opts ...Option) (*T, error) {
 	// Apply options
 	options := defaultOptions()
