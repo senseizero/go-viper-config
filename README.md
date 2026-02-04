@@ -14,7 +14,7 @@ Generic, tag-based configuration loading and validation system built on Viper.
 ## Installation
 
 ```bash
-go get forgejo.senseivision.ai/public/go-viper-config
+go get github.com/senseizero/go-viper-config
 ```
 
 ## Quick Start
@@ -22,7 +22,7 @@ go get forgejo.senseivision.ai/public/go-viper-config
 ```go
 package main
 
-import "forgejo.senseivision.ai/public/go-viper-config/viperconfig"
+import "github.com/senseizero/go-viper-config/viperconfig"
 
 type Config struct {
     Port    int      `mapstructure:"port" default:"8080"`
