@@ -69,6 +69,47 @@ cfg := viperconfig.MustLoad(&Config{},
 )
 ```
 
+## gRPC client fallback
+
+The `grpcclients` subpackage dials a list of gRPC URLs in order and returns
+the first connection whose `grpc_health_v1` `Check` succeeds. Paired with the
+CSV-to-slice env handling for `*urls` keys, this makes ephemeral PR
+environments trivially fall back to `develop` when a service isn't deployed
+in the PR stack:
+
+```bash
+export APP_SUKAUTO_URLS="pr-123-sukauto:9000,develop-sukauto:9000"
+```
+
+```go
+import (
+    "github.com/senseizero/go-viper-config/grpcclients"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+)
+
+type Config struct {
+    Sukauto struct {
+        URLs []string `mapstructure:"urls"`
+    } `mapstructure:"sukauto"`
+}
+
+cfg := viperconfig.MustLoad(&Config{})
+
+conn, err := grpcclients.DialWithFallback(ctx, cfg.Sukauto.URLs,
+    grpcclients.WithServiceName("sukauto"),
+    grpcclients.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
+)
+if err != nil { /* handle */ }
+defer conn.Close()
+
+sukauto := proto.NewSukautoClient(conn)
+```
+
+Options: `WithDialOptions`, `WithHealthTimeout` (default 5s), `WithServiceName`,
+`WithLogger` (`*slog.Logger`, defaults to `slog.Default()`). No async mode —
+if you want non-blocking startup, run `DialWithFallback` in a goroutine.
+
 ## License
 
 MIT
