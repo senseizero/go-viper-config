@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 )
 
 // Option configures DialWithFallback.
@@ -112,6 +114,13 @@ func dialAndProbe(ctx context.Context, url string, o options) (*grpc.ClientConn,
 	if _, err := grpc_health_v1.NewHealthClient(conn).Check(
 		probeCtx, &grpc_health_v1.HealthCheckRequest{},
 	); err != nil {
+		// Unimplemented means the server is reachable but doesn't register
+		// the grpc.health.v1.Health service — common on services predating
+		// the health protocol. Per gRPC convention this is "alive, no
+		// health protocol", not "unhealthy". Accept the connection.
+		if status.Code(err) == codes.Unimplemented {
+			return conn, nil
+		}
 		_ = conn.Close()
 		return nil, fmt.Errorf("health check: %w", err)
 	}

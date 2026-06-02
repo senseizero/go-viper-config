@@ -85,8 +85,12 @@ func TestDialWithFallback_FirstUnreachable(t *testing.T) {
 	}
 }
 
-func TestDialWithFallback_FirstHealthUnimplemented(t *testing.T) {
-	// Server reachable but without the health service → Check returns Unimplemented.
+func TestDialWithFallback_FirstHealthUnimplementedAccepted(t *testing.T) {
+	// Server reachable but without the health service → Check returns
+	// Unimplemented. Per gRPC convention this is "alive, no health protocol",
+	// not "unhealthy" — DialWithFallback accepts this connection rather than
+	// falling back. Required for ephemeral PR envs to keep working against
+	// long-running dev pods that predate the health protocol.
 	noHealth := startServer(t, 0)
 	liveAddr := startServer(t, grpc_health_v1.HealthCheckResponse_SERVING)
 
@@ -99,8 +103,8 @@ func TestDialWithFallback_FirstHealthUnimplemented(t *testing.T) {
 		t.Fatalf("DialWithFallback: %v", err)
 	}
 	defer conn.Close()
-	if conn.Target() != liveAddr {
-		t.Fatalf("expected fallback to %q, got %q", liveAddr, conn.Target())
+	if conn.Target() != noHealth {
+		t.Fatalf("expected Unimplemented to be accepted on first URL %q, got %q", noHealth, conn.Target())
 	}
 }
 
