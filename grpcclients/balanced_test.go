@@ -220,3 +220,24 @@ func TestDialBalanced_NoURLs(t *testing.T) {
 		t.Fatal("expected an error with no URLs")
 	}
 }
+
+// A single URL carrying a resolver scheme is handed to grpc.NewClient verbatim,
+// so the named resolver supplies the addresses. In the cluster that means
+// "dns:///headless-svc:port" — a plain ClusterIP would pin one pod. Here
+// "passthrough:///" stands in for it, since dns:/// would need real DNS.
+func TestDialBalanced_PassesThroughASchemedTarget(t *testing.T) {
+	b := startBackend(t, true)
+
+	conn, err := grpcclients.DialBalanced([]string{"passthrough:///" + b.addr},
+		grpcclients.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
+		grpcclients.WithWaitForReady(true),
+	)
+	if err != nil {
+		t.Fatalf("DialBalanced: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if !pingUntil(t, conn, func() bool { return b.calls.Load() > 0 }) {
+		t.Fatal("a schemed target never reached its backend")
+	}
+}
