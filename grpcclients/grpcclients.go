@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -122,6 +123,13 @@ var balancedSchemes atomic.Uint64
 // grpc.NewClient connects lazily, so this never blocks and never probes: an
 // endpoint that is down at boot simply joins the pool when it comes up.
 //
+// A single URL carrying a resolver scheme (anything with "://", e.g.
+// "dns:///sukyana-headless:6197") is passed to grpc.NewClient as-is, so that
+// resolver supplies the addresses. That is how you spread across the pods of a
+// Kubernetes Service: a plain ClusterIP is one VIP, so gRPC pins a single pod
+// for the life of the connection — point this at a HEADLESS service instead and
+// the dns resolver hands back every pod IP.
+//
 // The caller owns the returned conn and must Close it.
 func DialBalanced(urls []string, opts ...Option) (*grpc.ClientConn, error) {
 	if len(urls) == 0 {
@@ -132,32 +140,35 @@ func DialBalanced(urls []string, opts ...Option) (*grpc.ClientConn, error) {
 		opt(&o)
 	}
 
-	addresses := make([]resolver.Address, 0, len(urls))
-	for _, url := range urls {
-		addresses = append(addresses, resolver.Address{Addr: url})
-	}
-
-	// The builder is handed to this ClientConn only (WithResolvers), never to
-	// the global registry, so the scheme just has to be unique in-process.
-	scheme := fmt.Sprintf("balanced-%d", balancedSchemes.Add(1))
-	res := manual.NewBuilderWithScheme(scheme)
-	res.InitialState(resolver.State{Addresses: addresses})
-
-	dialOpts := []grpc.DialOption{
-		grpc.WithResolvers(res),
-		grpc.WithDefaultServiceConfig(balancedServiceConfig),
-	}
+	dialOpts := []grpc.DialOption{grpc.WithDefaultServiceConfig(balancedServiceConfig)}
 	if o.waitForReady {
 		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.WaitForReady(true)))
 	}
+
+	target := ""
+	if len(urls) == 1 && strings.Contains(urls[0], "://") {
+		target = urls[0]
+	} else {
+		addresses := make([]resolver.Address, 0, len(urls))
+		for _, url := range urls {
+			addresses = append(addresses, resolver.Address{Addr: url})
+		}
+		// The builder is handed to this ClientConn only (WithResolvers), never
+		// to the global registry, so the scheme just has to be unique in-process.
+		scheme := fmt.Sprintf("balanced-%d", balancedSchemes.Add(1))
+		res := manual.NewBuilderWithScheme(scheme)
+		res.InitialState(resolver.State{Addresses: addresses})
+		dialOpts = append(dialOpts, grpc.WithResolvers(res))
+		target = scheme + ":///backends"
+	}
 	dialOpts = append(dialOpts, o.dialOpts...)
 
-	conn, err := grpc.NewClient(scheme+":///backends", dialOpts...)
+	conn, err := grpc.NewClient(target, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("grpcclients: balanced dial for %q: %w", o.serviceName, err)
 	}
 	o.logger.Info("grpcclients: balanced conn created",
-		"service", o.serviceName, "backends", len(urls), "waitForReady", o.waitForReady)
+		"service", o.serviceName, "target", target, "backends", len(urls), "waitForReady", o.waitForReady)
 	return conn, nil
 }
 
