@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer/leastrequest"
 	"google.golang.org/grpc/codes"
 
 	// Registers the client-side health-checking producer that the
@@ -40,6 +41,8 @@ type options struct {
 	serviceName   string
 	logger        *slog.Logger
 	waitForReady  bool
+	// choiceCount > 0 selects least_request over the default round_robin.
+	choiceCount uint32
 }
 
 func defaults() options {
@@ -85,6 +88,53 @@ func WithWaitForReady(wait bool) Option {
 	return func(o *options) { o.waitForReady = wait }
 }
 
+// WithLeastRequest switches a balanced conn from the default round_robin to
+// least_request: instead of handing every backend an equal NUMBER of RPCs, each
+// pick samples choiceCount backends at random and routes to whichever has the
+// fewest OUTSTANDING RPCs.
+//
+// Use it when the backends are NOT equally fast. round_robin is count-fair, not
+// load-fair, so a pool mixing a fast and a slow worker over-dispatches the slow
+// one: it keeps receiving its half of the RPCs however long its queue grows,
+// and the excess eventually times out. least_request instead lets a slow backend
+// fill up and then routes around it, so each backend absorbs work in proportion
+// to the rate it actually drains it.
+//
+// This counts long-lived streams, not just unary calls: gRPC increments the
+// counter when the picker fires (once, at stream creation) and only decrements
+// it from the RPC's Done callback, which for a stream runs at termination. A
+// backend chewing on a slow stream therefore stays "loaded" for that stream's
+// whole life — which is exactly what makes this the right policy for a pool of
+// streaming workers.
+//
+// choiceCount is gRFC A48's "choice_count": 0 uses gRPC's default of 2 (the
+// classic power-of-two-choices). Note the sample is taken WITH replacement, so
+// on a 2-backend pool choiceCount=2 draws the same backend twice half the time
+// and the routing is only biased, not strictly least-loaded. Raise it for small
+// pools — at the maximum of 10 a 2-backend pool misses a backend ~0.2% of the
+// time, i.e. it picks the least-loaded one essentially always. Values are
+// clamped to A48's [2,10] range, so an out-of-range knob can't fail the dial.
+//
+// Health checking is unaffected: least_request drives the same client-side
+// health listener as round_robin, so NOT_SERVING backends still leave the picker.
+func WithLeastRequest(choiceCount uint32) Option {
+	return func(o *options) {
+		if choiceCount == 0 {
+			choiceCount = defaultChoiceCount
+		}
+		o.choiceCount = min(max(choiceCount, defaultChoiceCount), maxChoiceCount)
+	}
+}
+
+// gRFC A48 defaults choice_count to 2, rejects anything below it, and caps it
+// at 10. Mirrored here so a caller's knob is clamped rather than rejected: an
+// invalid default service config makes grpc.NewClient fail, and callers dial at
+// boot, so that would be a crashloop rather than a misconfiguration.
+const (
+	defaultChoiceCount = 2
+	maxChoiceCount     = 10
+)
+
 // ErrNoURLs is returned when DialWithFallback is called with an empty URL list.
 var ErrNoURLs = errors.New("grpcclients: no URLs configured")
 
@@ -96,18 +146,36 @@ var ErrNoURLs = errors.New("grpcclients: no URLs configured")
 // A backend that does not implement grpc.health.v1 answers Unimplemented; per
 // gRFC A17 gRPC then disables health checking for that subchannel and keeps it
 // in the picker, so services predating the health protocol still receive load.
-const balancedServiceConfig = `{
-  "loadBalancingConfig": [{"round_robin": {}}],
+//
+// The policy is round_robin unless the caller asked for WithLeastRequest, so
+// every existing caller keeps the exact config it had.
+func balancedServiceConfig(choiceCount uint32) string {
+	policy := `{"round_robin": {}}`
+	if choiceCount > 0 {
+		// leastrequest.Name is "least_request_experimental", not "least_request":
+		// the policy is still experimental in grpc-go, and the service config must
+		// name it exactly as registered or grpc.NewClient rejects the config.
+		// Referencing the const (rather than hardcoding the string) also keeps the
+		// import non-blank, so the init() that registers the balancer cannot be
+		// dropped by a stray goimports run.
+		policy = fmt.Sprintf(`{%q: {"choiceCount": %d}}`, leastrequest.Name, choiceCount)
+	}
+	return fmt.Sprintf(`{
+  "loadBalancingConfig": [%s],
   "healthCheckConfig": {"serviceName": ""}
-}`
+}`, policy)
+}
 
 // balancedSchemes numbers the per-conn resolver schemes so that two balanced
 // conns in one process (say, a GPU tier and a CPU tier) never collide.
 var balancedSchemes atomic.Uint64
 
-// DialBalanced returns a single ClientConn that round-robins RPCs across every
-// URL, with client-side health checking keeping unhealthy backends out of the
-// picker. Backends that recover are picked up again without a redial.
+// DialBalanced returns a single ClientConn that spreads RPCs across every URL,
+// with client-side health checking keeping unhealthy backends out of the picker.
+// Backends that recover are picked up again without a redial.
+//
+// The default policy is round_robin, which is count-fair. When the backends are
+// not equally fast, pass WithLeastRequest to route by outstanding load instead.
 //
 // This is the counterpart to DialWithFallback: that one binds ONE endpoint at
 // startup and never re-selects, which turns a pool of replicas into a pool of
@@ -140,7 +208,7 @@ func DialBalanced(urls []string, opts ...Option) (*grpc.ClientConn, error) {
 		opt(&o)
 	}
 
-	dialOpts := []grpc.DialOption{grpc.WithDefaultServiceConfig(balancedServiceConfig)}
+	dialOpts := []grpc.DialOption{grpc.WithDefaultServiceConfig(balancedServiceConfig(o.choiceCount))}
 	if o.waitForReady {
 		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.WaitForReady(true)))
 	}
@@ -167,8 +235,13 @@ func DialBalanced(urls []string, opts ...Option) (*grpc.ClientConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("grpcclients: balanced dial for %q: %w", o.serviceName, err)
 	}
+	policy := "round_robin"
+	if o.choiceCount > 0 {
+		policy = fmt.Sprintf("%s(choiceCount=%d)", leastrequest.Name, o.choiceCount)
+	}
 	o.logger.Info("grpcclients: balanced conn created",
-		"service", o.serviceName, "target", target, "backends", len(urls), "waitForReady", o.waitForReady)
+		"service", o.serviceName, "target", target, "backends", len(urls),
+		"waitForReady", o.waitForReady, "policy", policy)
 	return conn, nil
 }
 
