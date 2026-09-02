@@ -15,10 +15,12 @@ import (
 
 // LoadOptions configures how configuration is loaded
 type LoadOptions struct {
-	envPrefix   string
-	configName  string
-	configPaths []string
-	configType  string
+	envPrefix      string
+	configName     string
+	configPaths    []string
+	configType     string
+	noEnvBinding   bool
+	strictDefaults bool
 }
 
 // Option is a functional option for configuring LoadOptions
@@ -52,6 +54,38 @@ func WithConfigPaths(paths ...string) Option {
 func WithConfigType(configType string) Option {
 	return func(o *LoadOptions) {
 		o.configType = configType
+	}
+}
+
+// WithoutEnvKeyBinding disables the per-key env binding that Load performs
+// before unmarshaling.
+//
+// Binding is on by default because without it viper only unmarshals keys that
+// already exist in the YAML: an env-only field silently stays at its zero value
+// (see the "Quirks" section of the README). Turn it off only to reproduce the
+// v1.3.0 behaviour of a service whose environment carries variables that happen
+// to collide with config keys it deliberately never wired up.
+func WithoutEnvKeyBinding() Option {
+	return func(o *LoadOptions) {
+		o.noEnvBinding = true
+	}
+}
+
+// WithStrictDefaults makes an explicitly configured value win over the field's
+// `default` tag, including when that value is the type's zero value.
+//
+// Without it, validate() re-applies the default onto any field isEmpty()
+// considers empty, so `false`, `0` and `""` are indistinguishable from "not
+// configured" — which is why a bool with `default:"true"` cannot be turned off
+// and an int with a non-zero default cannot be set to 0.
+//
+// It is opt-in in v1.x because turning it on changes the value a service reads
+// wherever a config file or env var already sets one of those zero values. It
+// becomes the default in v2.0.0. Before enabling it, check what your YAML and
+// deployed env actually set: hack/audit-zero-defaults.sh does that for one repo.
+func WithStrictDefaults() Option {
+	return func(o *LoadOptions) {
+		o.strictDefaults = true
 	}
 }
 
@@ -105,6 +139,8 @@ func Load[T any](cfg *T, opts ...Option) (*T, error) {
 
 	// Create validator and load
 	validator := NewValidator(v)
+	validator.bindEnvKeys = !options.noEnvBinding
+	validator.strictDefaults = options.strictDefaults
 	if err := validator.LoadAndValidate(cfg); err != nil {
 		return nil, err
 	}
@@ -144,11 +180,18 @@ func setupViperWithOptions(opts LoadOptions) *viper.Viper {
 // Validator provides configuration validation functionality
 type Validator struct {
 	v *viper.Viper
+	// bindEnvKeys binds every struct key to its env var before unmarshaling.
+	// See WithoutEnvKeyBinding.
+	bindEnvKeys bool
+	// strictDefaults keeps an explicitly configured zero value from being
+	// overwritten by a `default` tag. See WithStrictDefaults.
+	strictDefaults bool
 }
 
-// NewValidator creates a new Validator instance
+// NewValidator creates a new Validator instance with env-key binding enabled,
+// matching what Load does by default.
 func NewValidator(v *viper.Viper) *Validator {
-	return &Validator{v: v}
+	return &Validator{v: v, bindEnvKeys: true}
 }
 
 // LoadAndValidate loads configuration from Viper into the provided struct and validates it
@@ -162,9 +205,17 @@ func NewValidator(v *viper.Viper) *Validator {
 //
 // By default, all fields are required unless marked optional or have a default value.
 func (val *Validator) LoadAndValidate(cfg interface{}) error {
-	// Convert CSV environment variables to slices for keys ending in "urls"
-	val.convertCSVEnvVarsToSlices()
-	
+	// The struct is the key model: viper only knows the keys its config file
+	// happens to declare, so everything below is driven off the fields the
+	// caller actually asked to be populated.
+	keys := structKeys(cfg)
+
+	// Bind each key to its env var, so an env-only field is unmarshaled at all.
+	val.bindEnvKeysToViper(keys)
+
+	// Convert comma-separated strings into slices for []string fields.
+	val.convertCSVToSlices(keys)
+
 	// Expand environment variables like ${VAR} or ${VAR:-default}
 	val.expandEnvVars()
 	
@@ -244,7 +295,7 @@ func (val *Validator) validate(v reflect.Value, prefix string, envPrefix string)
 		// Apply default value if specified
 		defaultValue := fieldType.Tag.Get("default")
 		hasDefault := defaultValue != ""
-		if hasDefault && val.isEmpty(field) {
+		if hasDefault && val.isEmpty(field) && !val.explicitlySet(fullKey) {
 			if err := val.setDefault(field, defaultValue); err != nil {
 				return fmt.Errorf("failed to set default value for %s: %w", fullKey, err)
 			}
@@ -387,23 +438,58 @@ func (val *Validator) validateRule(v reflect.Value, rule string, fieldName strin
 	return nil
 }
 
-// convertCSVEnvVarsToSlices converts comma-separated environment variable strings to slices
-// This allows setting list configurations via environment variables like:
-// APP_SERVICE_URLS="url1,url2,url3"
-func (val *Validator) convertCSVEnvVarsToSlices() {
-	for _, key := range val.v.AllKeys() {
-		if strings.HasSuffix(key, ".urls") || strings.HasSuffix(key, "urls") {
-			value := val.v.GetString(key)
-			if value != "" && strings.Contains(value, ",") {
-				// Split CSV and trim whitespace
-				urls := strings.Split(value, ",")
-				for i, url := range urls {
-					urls[i] = strings.TrimSpace(url)
-				}
-				val.v.Set(key, urls)
+// bindEnvKeysToViper binds every key of the config struct to its environment
+// variable.
+//
+// AutomaticEnv alone is not enough: Unmarshal decodes viper's AllSettings, and
+// a key that appears in no config file is in no AllSettings, so an env-only
+// field is never written and every key-walking step below would skip it too.
+// BindEnv registers the key, which puts it in AllKeys and lets the env value
+// reach the struct. The env var name is unchanged — it is the same
+// prefix + upper(key with "." replaced) that AutomaticEnv looks up.
+func (val *Validator) bindEnvKeysToViper(keys []structKey) {
+	if !val.bindEnvKeys {
+		return
+	}
+	for _, k := range keys {
+		// BindEnv only fails when called with no arguments.
+		_ = val.v.BindEnv(k.path)
+	}
+}
+
+// convertCSVToSlices splits comma-separated strings into slices for every
+// []string field, so a list can be supplied by a single env var:
+//
+//	APP_SERVICE_URLS="url1,url2,url3"
+//
+// The destination FIELD TYPE decides what gets split, not the key name: the
+// pre-1.4 converter only fired on keys ending in "urls" and only on keys viper
+// already knew, which silently skipped every env-only list.
+func (val *Validator) convertCSVToSlices(keys []structKey) {
+	for _, k := range keys {
+		if !k.stringSlice {
+			continue
+		}
+		raw, ok := val.v.Get(k.path).(string)
+		if !ok || raw == "" {
+			continue
+		}
+		parts := strings.Split(raw, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
 			}
 		}
+		val.v.Set(k.path, out)
 	}
+}
+
+// explicitlySet reports whether a config file or env var supplies this key, and
+// so whether a `default` tag must keep its hands off the field. Always false
+// unless WithStrictDefaults is on, which is what keeps v1.x behaviour intact.
+func (val *Validator) explicitlySet(key string) bool {
+	return val.strictDefaults && val.v.IsSet(key)
 }
 
 // expandEnvVars expands environment variables in config values
