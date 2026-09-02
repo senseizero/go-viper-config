@@ -1,7 +1,7 @@
 // Package grpcclients provides a gRPC dial helper that tries a list of URLs
 // in order and returns a connection to the first one whose grpc_health_v1
 // Check succeeds. The URL-list convention pairs naturally with the parent
-// package's CSV-to-slice handling for env vars ending in "urls", which is
+// package's CSV-to-slice handling for []string fields, which is
 // what makes ephemeral PR environments easy: a PR env sets
 // APP_SUKAUTO_URLS="pr-123-sukauto:9000,develop-sukauto:9000" and falls
 // back to develop whenever the PR copy is not deployed.
